@@ -1,0 +1,21 @@
+{
+  "name": "turbo-asar-electron-comparison",
+  "version": "1.0.0",
+  "main": "benchmark.js",
+  "scripts": {
+    "benchmark": "node benchmark.js"
+  },
+  "keywords": [
+    "asar",
+    "benchmark",
+    "performance"
+  ],
+  "author": "kitbyte",
+  "license": "MIT",
+  "description": "Benchmark comparing turbo-asar vs @electron/asar performance",
+  "dependencies": {
+    "@electron/asar": "^3.3.0",
+    "chalk": "^4.1.2",
+    "cli-table3": "^0.6.5"
+  }
+}

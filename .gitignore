@@ -1,0 +1,37 @@
+/node_modules
+/build
+/tmp
+*.swp
+*.log
+*~
+.DS_Store
+.node-version
+npm-debug.log
+.idea
+lib
+docs
+.yarn/install-state.gz
+
+# C build artifacts
+/c/build/
+/_codeql_*/
+/c/_codeql_*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+Testing/
+_codeql*
+
+# Benchmark artifacts
+benchmarks/electron-comparison/node_modules/
+benchmarks/electron-comparison/tmp/
+benchmarks/electron-comparison/benchmark_results.json
+benchmarks/electron-comparison/benchmark_results.md
