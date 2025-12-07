@@ -235,7 +235,7 @@ __attribute__((target("+crypto")))
 static void sha256_transform_arm64(sha256_ctx_t *ctx, const uint8_t *data, size_t num_blocks)
 {
     uint32x4_t msg0, msg1, msg2, msg3;
-    uint32x4_t state0, state1, save0, save1, tmp;
+    uint32x4_t state0, state1, save0, save1, tmp, tmp_state;
 
     state0 = vld1q_u32(&ctx->state[0]);
     state1 = vld1q_u32(&ctx->state[4]);
@@ -250,29 +250,33 @@ static void sha256_transform_arm64(sha256_ctx_t *ctx, const uint8_t *data, size_
         msg0 = vld1q_u32((const uint32_t*)(data + 0));
         msg0 = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(msg0)));
         tmp = vaddq_u32(msg0, vld1q_u32(&K[0]));
+        tmp_state = state0;
         state0 = vsha256hq_u32(state0, state1, tmp);
-        state1 = vsha256h2q_u32(state1, state0, tmp);
+        state1 = vsha256h2q_u32(state1, tmp_state, tmp);
 
         /* Rounds 4-7 */
         msg1 = vld1q_u32((const uint32_t*)(data + 16));
         msg1 = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(msg1)));
         tmp = vaddq_u32(msg1, vld1q_u32(&K[4]));
+        tmp_state = state0;
         state0 = vsha256hq_u32(state0, state1, tmp);
-        state1 = vsha256h2q_u32(state1, state0, tmp);
+        state1 = vsha256h2q_u32(state1, tmp_state, tmp);
 
         /* Rounds 8-11 */
         msg2 = vld1q_u32((const uint32_t*)(data + 32));
         msg2 = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(msg2)));
         tmp = vaddq_u32(msg2, vld1q_u32(&K[8]));
+        tmp_state = state0;
         state0 = vsha256hq_u32(state0, state1, tmp);
-        state1 = vsha256h2q_u32(state1, state0, tmp);
+        state1 = vsha256h2q_u32(state1, tmp_state, tmp);
 
         /* Rounds 12-15 */
         msg3 = vld1q_u32((const uint32_t*)(data + 48));
         msg3 = vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(msg3)));
         tmp = vaddq_u32(msg3, vld1q_u32(&K[12]));
+        tmp_state = state0;
         state0 = vsha256hq_u32(state0, state1, tmp);
-        state1 = vsha256h2q_u32(state1, state0, tmp);
+        state1 = vsha256h2q_u32(state1, tmp_state, tmp);
 
         /* Unrolled Schedule + Rounds 16-63 */
         for (int i = 0; i < 12; i++) {
@@ -290,8 +294,9 @@ static void sha256_transform_arm64(sha256_ctx_t *ctx, const uint8_t *data, size_
              *m0_ptr = vsha256su0q_u32(*m0_ptr, *m1_ptr);
              *m0_ptr = vsha256su1q_u32(*m0_ptr, *m2_ptr, *m3_ptr);
              tmp = vaddq_u32(*m0_ptr, vld1q_u32(&K[k_idx]));
+             tmp_state = state0;
              state0 = vsha256hq_u32(state0, state1, tmp);
-             state1 = vsha256h2q_u32(state1, state0, tmp);
+             state1 = vsha256h2q_u32(state1, tmp_state, tmp);
         }
 
         state0 = vaddq_u32(state0, save0);
