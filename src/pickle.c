@@ -10,8 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Initial buffer capacity for writer */
-#define INITIAL_CAPACITY 64
+/* Initial buffer capacity for writer (4 KiB — fits small headers without
+ * realloc; large headers grow exponentially from here). */
+#define INITIAL_CAPACITY 4096
 
 /* Align value up to PICKLE_ALIGN boundary */
 static inline size_t align_up(size_t value)

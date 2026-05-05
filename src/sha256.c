@@ -399,7 +399,6 @@ static void sha256_select_implementation(sha256_ctx_t *ctx, const uint8_t *data,
     sha256_transform_fn selected = sha256_transform_scalar;
 
 #ifdef SHA256_X86
-    unsigned int eax, ebx, ecx, edx;
     int has_sha_ni = 0, has_sse41 = 0;
 
     #if defined(_MSC_VER)
@@ -412,6 +411,7 @@ static void sha256_select_implementation(sha256_ctx_t *ctx, const uint8_t *data,
             has_sha_ni = (regs[1] & (1 << 29)) != 0;
         }
     #elif defined(__GNUC__) || defined(__clang__)
+        unsigned int eax, ebx, ecx, edx;
         if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) has_sse41 = (ecx & (1 << 19)) != 0;
         if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) has_sha_ni = (ebx & (1 << 29)) != 0;
     #endif

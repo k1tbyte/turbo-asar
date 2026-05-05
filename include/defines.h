@@ -26,6 +26,9 @@
     #endif
 #endif
 
+#ifndef __has_attribute
+#define __has_attribute(x) 0
+#endif
 
 #if __has_attribute(__fallthrough__)
 # define fallthrough                    __attribute__((__fallthrough__))

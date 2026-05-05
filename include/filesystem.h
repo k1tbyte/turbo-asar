@@ -111,6 +111,25 @@ bool asar_filesystem_insert_file(
 );
 
 /**
+ * Replace integrity hash strings on an already-inserted file entry.
+ * Lengths must match the existing values exactly so the serialized header
+ * byte length is preserved (enables in-place archive patching).
+ *
+ * @param fs Filesystem context
+ * @param rel_path Path of an already-inserted file with placeholder integrity
+ * @param integrity_hash Real file hash, hex (length must match placeholder)
+ * @param block_hashes Real block hashes, hex (length and count must match)
+ * @param block_count Number of block hashes (must match existing count)
+ */
+bool asar_filesystem_update_file_integrity(
+    asar_filesystem_t *fs,
+    const char *rel_path,
+    const char *integrity_hash,
+    const char **block_hashes,
+    size_t block_count
+);
+
+/**
  * Insert a symlink entry
  */
 bool asar_filesystem_insert_link(

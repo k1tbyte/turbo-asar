@@ -50,26 +50,22 @@ const char* get_relative_path(asar_filesystem_t *fs, const char *path)
     return path;
 }
 
-/* Find or create node for a path (returns "files" object for directory) */
-static cJSON* find_or_create_node(asar_filesystem_t *fs, const char *rel_path, bool create_parent)
+/* Find or create node for a path (returns the leaf node) */
+static cJSON* find_or_create_node(asar_filesystem_t *fs, const char *rel_path)
 {
     cJSON *node = fs->header;
     char *path_copy = strdup(rel_path);
     if (!path_copy) return NULL;
-    
+
     normalize_path(path_copy);
-    
+
     char *token = strtok(path_copy, PATH_SEPARATOR_STR "/\\");
-    char *next_token = token ? strtok(NULL, PATH_SEPARATOR_STR "/\\") : NULL;
-    
     while (token) {
         if (strcmp(token, ".") == 0) {
-            token = next_token;
-            next_token = token ? strtok(NULL, PATH_SEPARATOR_STR "/\\") : NULL;
+            token = strtok(NULL, PATH_SEPARATOR_STR "/\\");
             continue;
         }
-        
-        /* Get or create "files" object */
+
         cJSON *files = cJSON_GetObjectItemCaseSensitive(node, "files");
         if (!files) {
             files = cJSON_AddObjectToObject(node, "files");
@@ -78,25 +74,20 @@ static cJSON* find_or_create_node(asar_filesystem_t *fs, const char *rel_path, b
                 return NULL;
             }
         }
-        
-        /* Get or create child node */
+
         cJSON *child = cJSON_GetObjectItemCaseSensitive(files, token);
         if (!child) {
-            if (!create_parent && next_token == NULL) {
-                /* Don't create if it's the final component and we're just reading */
-            }
             child = cJSON_AddObjectToObject(files, token);
             if (!child) {
                 free(path_copy);
                 return NULL;
             }
         }
-        
+
         node = child;
-        token = next_token;
-        next_token = token ? strtok(NULL, PATH_SEPARATOR_STR "/\\") : NULL;
+        token = strtok(NULL, PATH_SEPARATOR_STR "/\\");
     }
-    
+
     free(path_copy);
     return node;
 }
@@ -243,7 +234,7 @@ bool asar_filesystem_insert_directory(asar_filesystem_t *fs, const char *rel_pat
         return true;
     }
     
-    cJSON *node = find_or_create_node(fs, rel_path, true);
+    cJSON *node = find_or_create_node(fs, rel_path);
     if (!node) return false;
 
     if (unpacked) {
@@ -274,7 +265,7 @@ bool asar_filesystem_insert_file(
 {
     if (!fs || !rel_path) return false;
 
-    cJSON *node = find_or_create_node(fs, rel_path, true);
+    cJSON *node = find_or_create_node(fs, rel_path);
     if (!node) return false;
     
     /* Add file properties */
@@ -314,6 +305,57 @@ bool asar_filesystem_insert_file(
     return true;
 }
 
+bool asar_filesystem_update_file_integrity(
+    asar_filesystem_t *fs,
+    const char *rel_path,
+    const char *integrity_hash,
+    const char **block_hashes,
+    size_t block_count
+)
+{
+    if (!fs || !rel_path || !integrity_hash || !block_hashes) return false;
+
+    cJSON *node = fs->header;
+    char *path_copy = strdup(rel_path);
+    if (!path_copy) return false;
+    normalize_path(path_copy);
+
+    char *token = strtok(path_copy, PATH_SEPARATOR_STR "/\\");
+    while (token) {
+        if (strcmp(token, ".") != 0) {
+            cJSON *files = cJSON_GetObjectItemCaseSensitive(node, "files");
+            if (!files) { free(path_copy); return false; }
+            node = cJSON_GetObjectItemCaseSensitive(files, token);
+            if (!node) { free(path_copy); return false; }
+        }
+        token = strtok(NULL, PATH_SEPARATOR_STR "/\\");
+    }
+    free(path_copy);
+
+    cJSON *integrity = cJSON_GetObjectItemCaseSensitive(node, "integrity");
+    if (!integrity) return false;
+
+    cJSON *hash_item = cJSON_GetObjectItemCaseSensitive(integrity, "hash");
+    if (!hash_item || !cJSON_IsString(hash_item)) return false;
+    /* Length must match — JSON header byte length must stay invariant so
+     * we can patch it in place without recomputing offsets. */
+    if (strlen(hash_item->valuestring) != strlen(integrity_hash)) return false;
+    if (!cJSON_SetValuestring(hash_item, integrity_hash)) return false;
+
+    cJSON *blocks = cJSON_GetObjectItemCaseSensitive(integrity, "blocks");
+    if (!blocks || !cJSON_IsArray(blocks)) return false;
+    if ((size_t)cJSON_GetArraySize(blocks) != block_count) return false;
+
+    for (size_t i = 0; i < block_count; i++) {
+        cJSON *blk = cJSON_GetArrayItem(blocks, (int)i);
+        if (!blk || !cJSON_IsString(blk)) return false;
+        if (strlen(blk->valuestring) != strlen(block_hashes[i])) return false;
+        if (!cJSON_SetValuestring(blk, block_hashes[i])) return false;
+    }
+
+    return true;
+}
+
 bool asar_filesystem_insert_link(
     asar_filesystem_t *fs,
     const char *rel_path,
@@ -323,7 +365,7 @@ bool asar_filesystem_insert_link(
 {
     if (!fs || !rel_path || !link_target) return false;
 
-    cJSON *node = find_or_create_node(fs, rel_path, true);
+    cJSON *node = find_or_create_node(fs, rel_path);
     if (!node) return false;
     
     cJSON_AddStringToObject(node, "link", link_target);
