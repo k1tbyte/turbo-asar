@@ -16,6 +16,8 @@
 #include "pickle.h"
 #include "sha256.h"
 #include "filesystem.h"
+#include "ta_thread.h"
+#include "ta_io.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -52,8 +54,7 @@
  * hashes are known. Length matches a real hex digest, so the serialized
  * header byte length is invariant w.r.t. real hashes — required for
  * single-pass pack with in-place header patching. */
-static const char k_placeholder_hash[SHA256_HEX_SIZE] =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+/* (placeholder no longer needed: pack now hashes BEFORE serializing the header) */
 
 static turbo_asar_error_t mkdir_recursive(const char *path)
 {
@@ -134,6 +135,7 @@ typedef struct file_entry {
     bool executable;
     bool has_integrity;        /* set if real hashes will be computed */
     uint64_t size;             /* file size (files only) */
+    uint64_t data_offset;      /* offset within the archive's data section */
     char *symlink_target;      /* readlink target (links only) */
     /* Integrity (allocated only when has_integrity) */
     size_t block_count;
@@ -369,20 +371,33 @@ static turbo_asar_error_t read_archive_header(
 /* Stream a file: copy from input to output, update file + per-block SHA-256
  * if has_integrity. Block hashes are written into entry->block_hashes_arr[i]
  * (each pointing into entry->block_hashes_buf). */
-static bool stream_file_to_archive(
-    file_entry_t *entry,
-    FILE *in,
-    FILE *out,
-    uint8_t *buffer
-)
+/* stream_file_to_archive removed: pack path now uses parallel mmap+pwrite. */
+
+/* ----- Parallel SHA-256 pre-pass -----
+ *
+ * Hashes are computed in worker threads BEFORE the data write phase, so the
+ * write phase becomes a pure copy. Buffers (file_hash, block_hashes_arr) are
+ * pre-allocated by the main thread during stat/insert, so workers only fill
+ * already-owned memory. No shared state between workers except the work
+ * queue index. */
+
+#define HASH_WORKER_BUF_SIZE (256 * 1024)
+#define HASH_PARALLEL_MIN_FILES 4
+#define HASH_PARALLEL_THREAD_CAP 8
+
+typedef struct pack_work {
+    file_entry_t **entries;
+    size_t count;
+    size_t next_idx;
+    ta_mutex_t mutex;
+} pack_work_t;
+
+static void compute_entry_integrity(file_entry_t *e, uint8_t *buffer)
 {
-    if (!entry->has_integrity) {
-        size_t bytes_read;
-        while ((bytes_read = fread(buffer, 1, READ_BUFFER_SIZE, in)) > 0) {
-            if (fwrite(buffer, 1, bytes_read, out) != bytes_read) return false;
-        }
-        return true;
-    }
+    if (!e->has_integrity) return;
+
+    FILE *fp = fopen(e->path, "rb");
+    if (!fp) return;
 
     sha256_ctx_t fctx, bctx;
     sha256_init(&fctx);
@@ -390,16 +405,15 @@ static bool stream_file_to_archive(
 
     size_t block_bytes = 0;
     size_t cur_block = 0;
-    size_t bytes_read;
+    size_t n;
 
-    while ((bytes_read = fread(buffer, 1, READ_BUFFER_SIZE, in)) > 0) {
-        if (fwrite(buffer, 1, bytes_read, out) != bytes_read) return false;
-        sha256_update(&fctx, buffer, bytes_read);
+    while ((n = fread(buffer, 1, HASH_WORKER_BUF_SIZE, fp)) > 0) {
+        sha256_update(&fctx, buffer, n);
 
         size_t off = 0;
-        while (off < bytes_read) {
+        while (off < n) {
             size_t space = BLOCK_SIZE - block_bytes;
-            size_t to_add = bytes_read - off;
+            size_t to_add = n - off;
             if (to_add > space) to_add = space;
             sha256_update(&bctx, buffer + off, to_add);
             block_bytes += to_add;
@@ -408,8 +422,8 @@ static bool stream_file_to_archive(
             if (block_bytes >= BLOCK_SIZE) {
                 uint8_t d[SHA256_DIGEST_SIZE];
                 sha256_final(&bctx, d);
-                if (cur_block < entry->block_count) {
-                    sha256_to_hex(d, entry->block_hashes_arr[cur_block]);
+                if (cur_block < e->block_count) {
+                    sha256_to_hex(d, e->block_hashes_arr[cur_block]);
                 }
                 cur_block++;
                 block_bytes = 0;
@@ -421,17 +435,219 @@ static bool stream_file_to_archive(
     if (block_bytes > 0 || cur_block == 0) {
         uint8_t d[SHA256_DIGEST_SIZE];
         sha256_final(&bctx, d);
-        if (cur_block < entry->block_count) {
-            sha256_to_hex(d, entry->block_hashes_arr[cur_block]);
+        if (cur_block < e->block_count) {
+            sha256_to_hex(d, e->block_hashes_arr[cur_block]);
         }
-        cur_block++;
     }
 
     uint8_t df[SHA256_DIGEST_SIZE];
     sha256_final(&fctx, df);
-    sha256_to_hex(df, entry->file_hash);
+    sha256_to_hex(df, e->file_hash);
 
-    return cur_block == entry->block_count;
+    fclose(fp);
+}
+
+static void *hash_worker(void *arg)
+{
+    pack_work_t *w = (pack_work_t *)arg;
+    uint8_t *buf = (uint8_t *)malloc(HASH_WORKER_BUF_SIZE);
+    if (!buf) return NULL;
+
+    for (;;) {
+        ta_mutex_lock(&w->mutex);
+        size_t i = w->next_idx;
+        if (i < w->count) w->next_idx = i + 1;
+        ta_mutex_unlock(&w->mutex);
+
+        if (i >= w->count) break;
+        compute_entry_integrity(w->entries[i], buf);
+    }
+
+    free(buf);
+    return NULL;
+}
+
+static int decide_thread_count(int requested, size_t work_items)
+{
+    if (requested == 1) return 1;
+    if (work_items < HASH_PARALLEL_MIN_FILES) return 1;
+
+    int n = requested > 0 ? requested : ta_cpu_count();
+    if (n > HASH_PARALLEL_THREAD_CAP) n = HASH_PARALLEL_THREAD_CAP;
+    if ((size_t)n > work_items) n = (int)work_items;
+    if (n < 1) n = 1;
+    return n;
+}
+
+static void run_serial_hash(file_entry_t *entries)
+{
+    uint8_t *buf = (uint8_t *)malloc(HASH_WORKER_BUF_SIZE);
+    if (!buf) return;
+    for (file_entry_t *e = entries; e; e = e->next) {
+        if (e->has_integrity) compute_entry_integrity(e, buf);
+    }
+    free(buf);
+}
+
+static void run_parallel_hash(file_entry_t *entries, int max_threads)
+{
+    size_t hash_count = 0;
+    for (file_entry_t *e = entries; e; e = e->next) {
+        if (e->has_integrity) hash_count++;
+    }
+    if (hash_count == 0) return;
+
+    int n_threads = decide_thread_count(max_threads, hash_count);
+
+    if (n_threads <= 1) {
+        run_serial_hash(entries);
+        return;
+    }
+
+    file_entry_t **arr = (file_entry_t **)malloc(hash_count * sizeof(*arr));
+    if (!arr) {
+        run_serial_hash(entries);
+        return;
+    }
+
+    size_t idx = 0;
+    for (file_entry_t *e = entries; e; e = e->next) {
+        if (e->has_integrity) arr[idx++] = e;
+    }
+
+    pack_work_t work;
+    work.entries = arr;
+    work.count = hash_count;
+    work.next_idx = 0;
+    ta_mutex_init(&work.mutex);
+
+    /* Spawn n_threads-1 workers; main thread also drains the queue. */
+    int to_spawn = n_threads - 1;
+    ta_thread_t *threads = NULL;
+    int spawned = 0;
+    if (to_spawn > 0) {
+        threads = (ta_thread_t *)calloc((size_t)to_spawn, sizeof(ta_thread_t));
+        if (threads) {
+            for (int i = 0; i < to_spawn; i++) {
+                if (ta_thread_create(&threads[i], hash_worker, &work) == 0) spawned++;
+                else break;
+            }
+        }
+    }
+
+    hash_worker(&work);
+
+    for (int i = 0; i < spawned; i++) {
+        ta_thread_join(threads[i]);
+    }
+    free(threads);
+    ta_mutex_destroy(&work.mutex);
+    free(arr);
+}
+
+/* ----- Parallel data write (mmap source + pwrite to known offset) ----- */
+
+typedef struct {
+    file_entry_t **entries;     /* files only, in archive order */
+    size_t count;
+    size_t next_idx;
+    ta_mutex_t mutex;
+    ta_fd_t out_fd;
+    uint64_t data_section_start; /* byte offset of data section in archive */
+    bool ok;                     /* cleared on any failure */
+} write_work_t;
+
+static bool write_one_entry(file_entry_t *e, ta_fd_t fd, uint64_t base)
+{
+    if (e->size == 0) return true;
+
+    ta_mapped_t m;
+    if (!ta_map_read(e->path, &m)) return false;
+    ta_advise_sequential(&m);
+
+    bool ok = true;
+    if (m.size != e->size) {
+        /* File changed under us between stat and write. Truncate or pad to
+         * declared size to keep offsets valid; treat as soft failure. */
+        ok = false;
+    } else if (m.size > 0) {
+        ok = ta_pwrite_all(fd, m.data, m.size, base + e->data_offset);
+    }
+    ta_unmap(&m);
+    return ok;
+}
+
+static void *write_worker(void *arg)
+{
+    write_work_t *w = (write_work_t *)arg;
+    for (;;) {
+        ta_mutex_lock(&w->mutex);
+        size_t i = w->next_idx;
+        if (i < w->count) w->next_idx = i + 1;
+        ta_mutex_unlock(&w->mutex);
+        if (i >= w->count) break;
+
+        if (!write_one_entry(w->entries[i], w->out_fd, w->data_section_start)) {
+            ta_mutex_lock(&w->mutex);
+            w->ok = false;
+            ta_mutex_unlock(&w->mutex);
+        }
+    }
+    return NULL;
+}
+
+static bool run_parallel_write(
+    file_entry_t **arr, size_t count,
+    ta_fd_t out_fd, uint64_t data_start, int max_threads
+)
+{
+    if (count == 0) return true;
+
+    write_work_t work;
+    work.entries = arr;
+    work.count = count;
+    work.next_idx = 0;
+    work.out_fd = out_fd;
+    work.data_section_start = data_start;
+    work.ok = true;
+    ta_mutex_init(&work.mutex);
+
+    int n_threads = decide_thread_count(max_threads, count);
+    int to_spawn = n_threads - 1;
+    ta_thread_t *threads = NULL;
+    int spawned = 0;
+    if (to_spawn > 0) {
+        threads = (ta_thread_t *)calloc((size_t)to_spawn, sizeof(ta_thread_t));
+        if (threads) {
+            for (int i = 0; i < to_spawn; i++) {
+                if (ta_thread_create(&threads[i], write_worker, &work) == 0) spawned++;
+                else break;
+            }
+        }
+    }
+
+    write_worker(&work);
+
+    for (int i = 0; i < spawned; i++) {
+        ta_thread_join(threads[i]);
+    }
+    free(threads);
+    bool ok = work.ok;
+    ta_mutex_destroy(&work.mutex);
+    return ok;
+}
+
+/* Compute total bytes that will be written to the data section, given the
+ * current pack plan, and assign each file entry's data_offset. */
+static uint64_t assign_data_offsets(file_entry_t *entries)
+{
+    uint64_t off = 0;
+    for (file_entry_t *e = entries; e; e = e->next) {
+        if (e->is_dir || e->is_link || e->unpacked) continue;
+        e->data_offset = off;
+        off += e->size;
+    }
+    return off;
 }
 
 turbo_asar_error_t turbo_asar_pack(
@@ -459,23 +675,19 @@ turbo_asar_error_t turbo_asar_pack(
     file_entry_t *entries = crawl_directory(src_dir, options->exclude_hidden);
     char *unpack_pattern = options->unpack ? normalize_glob_pattern(options->unpack) : NULL;
 
-    /* First pass: stat + insert with placeholder hashes. */
+    /* Phase A: stat + classify every entry (no fs insert yet). Allocate
+     * integrity buffers up-front so the parallel hash pass can fill them
+     * without locks. */
     for (file_entry_t *entry = entries; entry; entry = entry->next) {
         const char *rel_path = get_relative_path(fs, entry->path);
-
         const bool should_unpack = unpack_pattern && glob_match(unpack_pattern, rel_path);
         entry->unpacked = should_unpack;
 
         if (entry->is_link) {
-            char *target = read_symlink(entry->path);
-            if (target) {
-                entry->symlink_target = target;
-                asar_filesystem_insert_link(fs, rel_path, target, should_unpack);
-            }
+            entry->symlink_target = read_symlink(entry->path);
             continue;
         }
         if (entry->is_dir) {
-            asar_filesystem_insert_directory(fs, rel_path, should_unpack);
             continue;
         }
 
@@ -484,49 +696,61 @@ turbo_asar_error_t turbo_asar_pack(
         entry->size = (uint64_t)fsize;
         entry->executable = is_executable(entry->path);
 
-        const bool want_integrity = integrity && entry->size > 0 && !should_unpack;
-        const char **placeholder_blocks = NULL;
-        size_t bc = 0;
-
-        if (want_integrity) {
-            bc = (size_t)((entry->size + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        if (integrity && entry->size > 0 && !should_unpack) {
+            const size_t bc = (size_t)((entry->size + BLOCK_SIZE - 1) / BLOCK_SIZE);
             entry->file_hash = malloc(SHA256_HEX_SIZE);
             entry->block_hashes_buf = malloc(bc * SHA256_HEX_SIZE);
             entry->block_hashes_arr = malloc(bc * sizeof(char *));
-            placeholder_blocks = malloc(bc * sizeof(char *));
-
-            if (!entry->file_hash || !entry->block_hashes_buf ||
-                !entry->block_hashes_arr || !placeholder_blocks) {
+            if (!entry->file_hash || !entry->block_hashes_buf || !entry->block_hashes_arr) {
                 free(entry->file_hash); entry->file_hash = NULL;
                 free(entry->block_hashes_buf); entry->block_hashes_buf = NULL;
                 free(entry->block_hashes_arr); entry->block_hashes_arr = NULL;
-                free(placeholder_blocks);
-                placeholder_blocks = NULL;
-                bc = 0;
-            } else {
-                for (size_t i = 0; i < bc; i++) {
-                    entry->block_hashes_arr[i] =
-                        entry->block_hashes_buf + i * SHA256_HEX_SIZE;
-                    placeholder_blocks[i] = k_placeholder_hash;
-                }
-                entry->block_count = bc;
-                entry->has_integrity = true;
+                continue;
             }
+            for (size_t i = 0; i < bc; i++) {
+                entry->block_hashes_arr[i] = entry->block_hashes_buf + i * SHA256_HEX_SIZE;
+            }
+            entry->block_count = bc;
+            entry->has_integrity = true;
+        }
+    }
+
+    /* Phase B: parallel SHA-256 (file + per-block) on all eligible entries.
+     * Workers fill entry->file_hash / block_hashes_arr in place. */
+    if (integrity) {
+        run_parallel_hash(entries, options->max_threads);
+    }
+
+    /* Phase C: assign data_offset per file (matches insert order below) and
+     * insert every entry into the filesystem with FINAL hashes. */
+    assign_data_offsets(entries);
+
+    for (file_entry_t *entry = entries; entry; entry = entry->next) {
+        const char *rel_path = get_relative_path(fs, entry->path);
+        const bool should_unpack = entry->unpacked;
+
+        if (entry->is_link) {
+            if (entry->symlink_target) {
+                asar_filesystem_insert_link(fs, rel_path, entry->symlink_target, should_unpack);
+            }
+            continue;
+        }
+        if (entry->is_dir) {
+            asar_filesystem_insert_directory(fs, rel_path, should_unpack);
+            continue;
         }
 
         asar_filesystem_insert_file(
             fs, rel_path, entry->size, entry->executable, should_unpack,
-            entry->has_integrity ? k_placeholder_hash : NULL,
-            placeholder_blocks, bc, BLOCK_SIZE
+            entry->has_integrity ? entry->file_hash : NULL,
+            (const char **)entry->block_hashes_arr, entry->block_count, BLOCK_SIZE
         );
-
-        free(placeholder_blocks);
     }
 
     free(unpack_pattern);
 
-    /* Serialize header (with placeholder hashes; same byte length as final). */
-    char *header_json;
+    /* Phase D: serialize final header (hashes already real, no patch needed). */
+    char *header_json = NULL;
     if (!asar_filesystem_serialize_header(fs, &header_json)) {
         free_file_entries(entries);
         asar_filesystem_free(fs);
@@ -535,26 +759,20 @@ turbo_asar_error_t turbo_asar_pack(
     const size_t header_json_len = strlen(header_json);
 
     pickle_writer_t header_pickle;
-    if (!pickle_writer_init(&header_pickle)) {
-        cJSON_free(header_json);
-        free_file_entries(entries);
-        asar_filesystem_free(fs);
-        return TURBO_ASAR_ERR_OUT_OF_MEMORY;
-    }
-    if (!pickle_write_string(&header_pickle, header_json, header_json_len)) {
+    if (!pickle_writer_init(&header_pickle) ||
+        !pickle_write_string(&header_pickle, header_json, header_json_len)) {
         pickle_writer_free(&header_pickle);
         cJSON_free(header_json);
         free_file_entries(entries);
         asar_filesystem_free(fs);
         return TURBO_ASAR_ERR_OUT_OF_MEMORY;
     }
+    cJSON_free(header_json);
 
     size_t header_pickle_size;
-    pickle_writer_data(&header_pickle, &header_pickle_size);
-
+    const uint8_t *header_data = pickle_writer_data(&header_pickle, &header_pickle_size);
     if (header_pickle_size > UINT32_MAX) {
         pickle_writer_free(&header_pickle);
-        cJSON_free(header_json);
         free_file_entries(entries);
         asar_filesystem_free(fs);
         return TURBO_ASAR_ERR_INVALID_HEADER;
@@ -565,20 +783,21 @@ turbo_asar_error_t turbo_asar_pack(
         !pickle_write_uint32(&size_pickle, (uint32_t)header_pickle_size)) {
         pickle_writer_free(&size_pickle);
         pickle_writer_free(&header_pickle);
-        cJSON_free(header_json);
         free_file_entries(entries);
         asar_filesystem_free(fs);
         return TURBO_ASAR_ERR_OUT_OF_MEMORY;
     }
+    size_t size_pickle_size;
+    const uint8_t *size_data = pickle_writer_data(&size_pickle, &size_pickle_size);
 
     /* Ensure output directory exists */
     char *dir_copy = strdup(dest_path);
     if (dir_copy) {
         char *last_sep = strrchr(dir_copy, '/');
-        #ifdef __WINDOWS__
+#ifdef __WINDOWS__
         char *last_sep_win = strrchr(dir_copy, '\\');
         if (last_sep_win > last_sep) last_sep = last_sep_win;
-        #endif
+#endif
         if (last_sep) {
             *last_sep = '\0';
             mkdir_recursive(dir_copy);
@@ -586,108 +805,64 @@ turbo_asar_error_t turbo_asar_pack(
         free(dir_copy);
     }
 
-    FILE *out = fopen(dest_path, "wb");
-    if (!out) {
+    /* Phase E: open output, preallocate, write header sequentially. */
+    const uint64_t data_total = assign_data_offsets(entries); /* same call, idempotent */
+    const uint64_t data_section_start = (uint64_t)size_pickle_size + header_pickle_size;
+    const uint64_t archive_total = data_section_start + data_total;
+
+    ta_fd_t out = ta_open_create(dest_path);
+    if (out == TA_INVALID_FD) {
         pickle_writer_free(&size_pickle);
         pickle_writer_free(&header_pickle);
-        cJSON_free(header_json);
         free_file_entries(entries);
         asar_filesystem_free(fs);
         return TURBO_ASAR_ERR_FILE_WRITE;
     }
+    ta_preallocate(out, archive_total);
 
-    size_t size_pickle_size;
-    const uint8_t *size_data = pickle_writer_data(&size_pickle, &size_pickle_size);
-    const uint8_t *header_data = pickle_writer_data(&header_pickle, &header_pickle_size);
-
-    bool write_ok =
-        fwrite(size_data, 1, size_pickle_size, out) == size_pickle_size &&
-        fwrite(header_data, 1, header_pickle_size, out) == header_pickle_size;
+    bool ok = ta_write_all(out, size_data, size_pickle_size) &&
+              ta_write_all(out, header_data, header_pickle_size);
 
     pickle_writer_free(&size_pickle);
-    /* keep header_pickle for size reference; we re-pickle into a fresh writer
-     * after data is written, so this is just a bookkeeping copy now. */
     pickle_writer_free(&header_pickle);
-    cJSON_free(header_json);
 
-    if (!write_ok) {
-        fclose(out);
+    if (!ok) {
+        ta_close_fd(out);
         free_file_entries(entries);
         asar_filesystem_free(fs);
         return TURBO_ASAR_ERR_FILE_WRITE;
     }
 
-    /* Single-pass data write: open, read+hash+write, close — once per file. */
-    uint8_t *buffer = malloc(READ_BUFFER_SIZE);
-    if (!buffer) {
-        fclose(out);
-        free_file_entries(entries);
-        asar_filesystem_free(fs);
-        return TURBO_ASAR_ERR_OUT_OF_MEMORY;
+    /* Phase F: parallel data write. Each file is mmapped and pwritten to its
+     * pre-known offset; workers operate on disjoint byte ranges so no locking
+     * is needed on the output fd. */
+    size_t file_count = 0;
+    for (file_entry_t *e = entries; e; e = e->next) {
+        if (!e->is_dir && !e->is_link && !e->unpacked) file_count++;
     }
 
     bool data_ok = true;
-    for (file_entry_t *entry = entries; entry && data_ok; entry = entry->next) {
-        if (entry->is_dir || entry->is_link || entry->unpacked) continue;
-
-        FILE *in = fopen(entry->path, "rb");
-        if (!in) continue;
-
-        if (!stream_file_to_archive(entry, in, out, buffer)) {
-            data_ok = false;
+    if (file_count > 0) {
+        file_entry_t **arr = (file_entry_t **)malloc(file_count * sizeof(*arr));
+        if (!arr) {
+            ta_close_fd(out);
+            free_file_entries(entries);
+            asar_filesystem_free(fs);
+            return TURBO_ASAR_ERR_OUT_OF_MEMORY;
         }
-        fclose(in);
-    }
-
-    free(buffer);
-
-    if (!data_ok) {
-        fclose(out);
-        free_file_entries(entries);
-        asar_filesystem_free(fs);
-        return TURBO_ASAR_ERR_FILE_WRITE;
-    }
-
-    /* Patch header in place with real hashes. */
-    if (integrity) {
-        bool any_updated = false;
+        size_t idx = 0;
         for (file_entry_t *e = entries; e; e = e->next) {
-            if (!e->has_integrity) continue;
-            const char *rel = get_relative_path(fs, e->path);
-            if (asar_filesystem_update_file_integrity(
-                    fs, rel, e->file_hash,
-                    (const char **)e->block_hashes_arr, e->block_count)) {
-                any_updated = true;
-            }
+            if (!e->is_dir && !e->is_link && !e->unpacked) arr[idx++] = e;
         }
-
-        if (any_updated) {
-            char *new_json = NULL;
-            if (asar_filesystem_serialize_header(fs, &new_json) && new_json) {
-                if (strlen(new_json) == header_json_len) {
-                    pickle_writer_t hp;
-                    if (pickle_writer_init(&hp) &&
-                        pickle_write_string(&hp, new_json, header_json_len)) {
-                        size_t hp_size;
-                        const uint8_t *hp_data = pickle_writer_data(&hp, &hp_size);
-                        if (hp_size == header_pickle_size) {
-                            if (ta_fseek64(out, (int64_t)size_pickle_size, SEEK_SET) == 0) {
-                                fwrite(hp_data, 1, hp_size, out);
-                            }
-                        }
-                    }
-                    pickle_writer_free(&hp);
-                }
-                cJSON_free(new_json);
-            }
-        }
+        data_ok = run_parallel_write(arr, file_count, out, data_section_start, options->max_threads);
+        free(arr);
     }
 
-    fclose(out);
+    ta_close_fd(out);
     free_file_entries(entries);
     asar_filesystem_free(fs);
 
-    return TURBO_ASAR_OK;
+    return data_ok ? TURBO_ASAR_OK : TURBO_ASAR_ERR_FILE_WRITE;
 }
 
 /* Simple hash table for caching created directories */

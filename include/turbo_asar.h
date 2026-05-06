@@ -64,6 +64,7 @@ typedef struct {
     const char *unpack;          /* Glob pattern for files to unpack */
     bool calculate_integrity;    /* Calculate SHA256 integrity for files */
     bool exclude_hidden;         /* Exclude hidden files (starting with .) */
+    int  max_threads;            /* 0 = auto, 1 = serial, N = cap workers to N */
 } turbo_asar_pack_options_t;
 
 /* ----- Core API ----- */

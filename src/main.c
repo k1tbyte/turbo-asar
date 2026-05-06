@@ -22,6 +22,7 @@ static void print_usage(const char *prog_name)
     printf("\nOptions:\n");
     printf("  --no-integrity    Skip integrity calculation when packing\n");
     printf("  --exclude-hidden  Exclude hidden files (starting with .)\n");
+    printf("  --threads N       Worker threads for pack (0=auto, 1=serial)\n");
     printf("  --help            Show this help message\n");
     printf("  --version         Show version\n");
 }
@@ -58,6 +59,11 @@ int main(int argc, char *argv[])
         }
         if (strcmp(argv[i], "--exclude-hidden") == 0) {
             options.exclude_hidden = true;
+            arg_start = i + 1;
+        }
+        if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            options.max_threads = atoi(argv[i + 1]);
+            i++;
             arg_start = i + 1;
         }
     }

@@ -23,8 +23,16 @@ set(LIB_SOURCES
         src/filesystem.c
         src/asar.c
         src/glob.c
+        src/ta_thread.c
+        src/ta_io.c
         vendor/cjson/cJSON.c
 )
+
+# Threading: pthread on POSIX, native Win32 on Windows (no extra link).
+if(NOT WIN32)
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+endif()
 
 # --- Compilation Flags ---
 
@@ -95,6 +103,9 @@ add_library(turbo_asar_static STATIC ${LIB_SOURCES})
 target_include_directories(turbo_asar_static PUBLIC ${PROJECT_ROOT}/include ${PROJECT_ROOT}/vendor/cjson)
 set_target_properties(turbo_asar_static PROPERTIES OUTPUT_NAME turbo_asar)
 target_compile_definitions(turbo_asar_static PUBLIC TURBO_ASAR_BUILD_STATIC)
+if(NOT WIN32)
+    target_link_libraries(turbo_asar_static PUBLIC Threads::Threads)
+endif()
 configure_target_for_build(turbo_asar_static)
 
 # Shared library, optional, alongside static.
@@ -107,6 +118,9 @@ if(BUILD_SHARED_LIBS)
     target_include_directories(turbo_asar_shared PUBLIC ${PROJECT_ROOT}/include ${PROJECT_ROOT}/vendor/cjson)
     set_target_properties(turbo_asar_shared PROPERTIES OUTPUT_NAME turbo_asar)
     target_compile_definitions(turbo_asar_shared PRIVATE TURBO_ASAR_BUILD_DLL)
+    if(NOT WIN32)
+        target_link_libraries(turbo_asar_shared PUBLIC Threads::Threads)
+    endif()
     configure_target_for_build(turbo_asar_shared)
     set(TURBO_ASAR_INSTALL_TARGETS turbo_asar_static turbo_asar_shared)
 else()
