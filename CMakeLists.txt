@@ -22,6 +22,7 @@ set(LIB_SOURCES
         src/pickle.c
         src/filesystem.c
         src/asar.c
+        src/asar_pack.c
         src/glob.c
         src/ta_thread.c
         src/ta_io.c
